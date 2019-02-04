@@ -12,13 +12,26 @@ use sgxs::loader::{Load, MappingInfo};
 use loader::{EnclaveBuilder, ErasedTcs};
 use std::os::raw::c_void;
 use usercalls::EnclaveState;
+use usercalls::ApiExtension;
+use std::fmt;
 
-#[derive(Debug)]
 pub struct Command {
     main: ErasedTcs,
     threads: Vec<ErasedTcs>,
     address: *mut c_void,
     size: usize,
+    api_ext_impl : Option<Box<ApiExtension>>,
+}
+
+impl fmt::Debug for Command {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        fmt.debug_struct("Command")
+            .field("main", &format_args!("{:?}", self.main))
+            .field("threads", &format_args!("{:?}", self.threads))
+            .field("address", &self.address)
+            .field("size", &self.size)
+            .finish()
+    }
 }
 
 impl MappingInfo for Command {
@@ -34,13 +47,15 @@ impl MappingInfo for Command {
 impl Command {
     /// # Panics
     /// Panics if the number of TCSs is 0.
-    pub(crate) fn internal_new(mut tcss: Vec<ErasedTcs>, address: *mut c_void, size: usize) -> Command {
+    pub(crate) fn internal_new(mut tcss: Vec<ErasedTcs>, address: *mut c_void, size: usize,
+                      api_ext_impl : Option<Box<ApiExtension>>) -> Command {
         let main = tcss.remove(0);
         Command {
             main,
             threads: tcss,
             address,
             size,
+            api_ext_impl,
         }
     }
 
@@ -49,6 +64,6 @@ impl Command {
     }
 
     pub fn run(self) -> Result<(), Error> {
-        EnclaveState::main_entry(self.main, self.threads)
+        EnclaveState::main_entry(self.main, self.threads, self.api_ext_impl)
     }
 }

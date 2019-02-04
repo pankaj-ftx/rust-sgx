@@ -32,7 +32,7 @@ lazy_static! {
 }
 
 pub mod abi;
-mod interface;
+pub mod interface;
 
 use self::abi::dispatch;
 use self::interface::{Handler, OutputBuffer};
@@ -47,11 +47,11 @@ struct ReadOnly<R>(R);
 struct WriteOnly<W>(W);
 
 macro_rules! forward {
-	(fn $n:ident(&mut self $(, $p:ident : $t:ty)*) -> $ret:ty) => {
-		fn $n(&mut self $(, $p: $t)*) -> $ret {
-			self.0 .$n($($p),*)
-		}
-	}
+    (fn $n:ident(&mut self $(, $p:ident : $t:ty)*) -> $ret:ty) => {
+        fn $n(&mut self $(, $p: $t)*) -> $ret {
+            self.0 .$n($($p),*)
+        }
+    }
 }
 
 impl<R: Read> Read for ReadOnly<R> {
@@ -144,7 +144,7 @@ where
     }
 }
 
-trait SyncStream: 'static + Send + Sync {
+pub trait SyncStream: 'static + Send + Sync {
     fn read_alloc(&self, out: &mut OutputBuffer) -> IoResult<()> {
         let mut buf = [0u8; 8192];
         let len = self.read(&mut buf)?;
@@ -287,6 +287,7 @@ pub(crate) struct EnclaveState {
     fds: Mutex<FnvHashMap<Fd, Arc<FileDesc>>>,
     last_fd: AtomicUsize,
     exiting: AtomicBool,
+    api_ext_impl: Box<ApiExtension>,
 }
 
 impl EnclaveState {
@@ -310,26 +311,32 @@ impl EnclaveState {
     fn new(
         kind: EnclaveKind,
         event_queues: FnvHashMap<TcsAddress, Mutex<Sender<u8>>>,
-    ) -> Arc<Self> {
+        api_ext_impl: Option<Box<ApiExtension>>) -> Arc<Self> {
         let mut fds = FnvHashMap::default();
         fds.insert(FD_STDIN, Arc::new(FileDesc::stream(Shared(io::stdin()))));
         fds.insert(FD_STDOUT, Arc::new(FileDesc::stream(Shared(io::stdout()))));
         fds.insert(FD_STDERR, Arc::new(FileDesc::stream(Shared(io::stderr()))));
         let last_fd = AtomicUsize::new(fds.keys().cloned().max().unwrap() as _);
 
+        let api_ext_impl = api_ext_impl.unwrap_or_else( || {
+                                      let d = ConnectStreamDefault;
+                                      Box::new(d)
+                                  });
+
         Arc::new(EnclaveState {
             kind,
             event_queues,
             fds: Mutex::new(fds),
             last_fd,
-            exiting: AtomicBool::new(false)
+            exiting: AtomicBool::new(false),
+            api_ext_impl : api_ext_impl,
         })
     }
 
     pub(crate) fn main_entry(
         main: ErasedTcs,
         threads: Vec<ErasedTcs>,
-    ) -> StdResult<(), failure::Error> {
+        api_ext_impl: Option<Box<ApiExtension>>) -> StdResult<(), failure::Error>  {
         let mut event_queues =
             FnvHashMap::with_capacity_and_hasher(threads.len() + 1, Default::default());
         let main = Self::event_queue_add_tcs(&mut event_queues, main);
@@ -349,7 +356,7 @@ impl EnclaveState {
             wait_secondary_threads: Condvar::new(),
         });
 
-        let enclave = EnclaveState::new(kind, event_queues);
+        let enclave = EnclaveState::new(kind, event_queues, api_ext_impl);
 
         let main_result = RunningTcs::entry(enclave.clone(), main, EnclaveEntry::ExecutableMain);
 
@@ -407,7 +414,8 @@ impl EnclaveState {
             })
     }
 
-    pub(crate) fn library(threads: Vec<ErasedTcs>) -> Arc<Self> {
+    pub(crate) fn library(threads: Vec<ErasedTcs>,
+                          api_ext_impl: Option<Box<ApiExtension>>) -> Arc<Self> {
         let mut event_queues =
             FnvHashMap::with_capacity_and_hasher(threads.len(), Default::default());
         let (send, recv) = channel();
@@ -422,7 +430,7 @@ impl EnclaveState {
             thread_sender: Mutex::new(send),
         });
 
-        EnclaveState::new(kind, event_queues)
+        EnclaveState::new(kind, event_queues, api_ext_impl)
     }
 
     pub(crate) fn library_entry(
@@ -544,6 +552,34 @@ fn trap_attached_debugger(tcs: usize) {
         signal::sigaction(signal::SIGTRAP, &old).unwrap();
     }
 }
+
+pub trait ApiExtension : 'static + Send + Sync {
+    fn connect_stream(
+        &self,
+        addr: &[u8],
+        local_addr: Option<&mut OutputBuffer>,
+        peer_addr: Option<&mut OutputBuffer>,
+    ) -> IoResult<Box<SyncStream>> {
+        let addr = str::from_utf8(addr).map_err(|_| IoErrorKind::ConnectionRefused)?;
+        let stream = TcpStream::connect(addr)?;
+        if let Some(local_addr) = local_addr {
+            match stream.local_addr() {
+                Ok(local) => local_addr.set(local.to_string().into_bytes()),
+                Err(_) => local_addr.set(&b"error"[..]),
+            }
+        }
+        if let Some(peer_addr) = peer_addr {
+            match stream.peer_addr() {
+                Ok(peer) => peer_addr.set(peer.to_string().into_bytes()),
+                Err(_) => peer_addr.set(&b"error"[..]),
+            }
+        }
+        Ok(Box::new(stream))
+    }
+}
+
+struct ConnectStreamDefault;
+impl ApiExtension for ConnectStreamDefault{}
 
 #[allow(unused_variables)]
 impl RunningTcs {
@@ -681,21 +717,8 @@ impl RunningTcs {
         local_addr: Option<&mut OutputBuffer>,
         peer_addr: Option<&mut OutputBuffer>,
     ) -> IoResult<Fd> {
-        let addr = str::from_utf8(addr).map_err(|_| IoErrorKind::ConnectionRefused)?;
-        let stream = TcpStream::connect(addr)?;
-        if let Some(local_addr) = local_addr {
-            match stream.local_addr() {
-                Ok(local) => local_addr.set(local.to_string().into_bytes()),
-                Err(_) => local_addr.set(&b"error"[..]),
-            }
-        }
-        if let Some(peer_addr) = peer_addr {
-            match stream.peer_addr() {
-                Ok(peer) => peer_addr.set(peer.to_string().into_bytes()),
-                Err(_) => peer_addr.set(&b"error"[..]),
-            }
-        }
-        Ok(self.alloc_fd(FileDesc::stream(stream)))
+        let stream = self.enclave.api_ext_impl.connect_stream(addr, local_addr, peer_addr)?;
+        Ok(self.alloc_fd(FileDesc::Stream(stream)))
     }
 
     #[inline(always)]

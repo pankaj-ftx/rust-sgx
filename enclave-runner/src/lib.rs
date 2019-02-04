@@ -30,3 +30,5 @@ mod usercalls;
 pub use command::Command;
 pub use library::Library;
 pub use loader::{EnclaveBuilder, EnclavePanic};
+pub use usercalls::{ApiExtension, SyncStream};
+pub use usercalls::interface::OutputBuffer;

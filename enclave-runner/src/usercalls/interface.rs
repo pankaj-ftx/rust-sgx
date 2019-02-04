@@ -159,7 +159,7 @@ impl<'a> Usercalls for Handler<'a> {
     }
 }
 
-pub(super) struct OutputBuffer<'a> {
+pub struct OutputBuffer<'a> {
     buf: &'a mut ByteBuffer,
     data: Option<Box<[u8]>>,
 }
